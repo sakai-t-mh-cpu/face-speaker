@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>顔形状認識</title>
+<style>
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    padding:12px;
+    font-family:Arial,"Noto Sans JP",sans-serif;
+    background:#fff;
+    color:#222;
+  }
+  .cameras{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:10px;
+  }
+  .view{
+    position:relative;
+    width:100%;
+    aspect-ratio:4/3;
+    background:#111;
+    overflow:hidden;
+    border-radius:6px;
+  }
+  video,.overlay{
+    position:absolute;
+    inset:0;
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    transform:scaleX(-1);
+  }
+  .overlay{pointer-events:none}
+  .controls{
+    margin-top:12px;
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px;
+    align-items:center;
+  }
+  input,button,select{
+    font-size:16px;
+    padding:9px 12px;
+  }
+  input{min-width:180px}
+  select{
+    min-width:200px;
+    max-width:100%;
+    cursor:pointer;
+    background:#fff;
+    border:1px solid #ccc;
+    border-radius:4px;
+  }
+  button{cursor:pointer}
+  #status{margin-top:10px;min-height:1.5em}
+  #savedList{margin-top:8px}
+  .item{
+    display:flex;
+    gap:8px;
+    align-items:center;
+    margin:5px 0;
+  }
+  .item button{padding:5px 9px;font-size:14px}
+  @media(max-width:700px){
+    .cameras{grid-template-columns:1fr}
+  }
+</style>
+</head>
+<body>
+
+<div class="cameras">
+  <div class="view">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="landmarkCanvas" class="overlay"></canvas>
+  </div>
+  <div class="view">
+    <video id="video2" autoplay playsinline muted></video>
+  </div>
+</div>
+
+<div class="controls">
+  <select id="cameraSelect">
+    <option value="">カメラを選択中…</option>
+  </select>
+  <input id="nameInput" type="text" placeholder="名前（例：おはよう）">
+  <button id="saveBtn">この顔を記憶</button>
+  <button id="clearBtn">保存を消去</button>
+</div>
+
+<div id="status">カメラを起動しています…</div>
+<div id="savedList"></div>
+
+<script type="module">
+import {
+  FaceLandmarker,
+  FilesetResolver
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22";
+
+const video = document.getElementById("video");
+const video2 = document.getElementById("video2");
+const canvas = document.getElementById("landmarkCanvas");
+const ctx = canvas.getContext("2d");
+const cameraSelect = document.getElementById("cameraSelect");
+const nameInput = document.getElementById("nameInput");
+const saveBtn = document.getElementById("saveBtn");
+const clearBtn = document.getElementById("clearBtn");
+const statusEl = document.getElementById("status");
+const savedList = document.getElementById("savedList");
+
+let faceLandmarker;
+let lastVideoTime = -1;
+let currentLandmarks = null;
+let lastSimilarities = new Map();
+let armed = new Map();
+let currentStream = null;
+
+const STORAGE_KEY = "face_shape_voice_switch_v1";
+
+function getSaved(){
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]"); }
+  catch(e){ return []; }
+}
+function setSaved(data){
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+}
+
+function drawLandmarks(points){
+  const w=canvas.width, h=canvas.height;
+  ctx.clearRect(0,0,w,h);
+  if(!points) return;
+
+  ctx.fillStyle="#00ff66";
+  for(const p of points){
+    const x=(1-p.x)*w;
+    const y=p.y*h;
+    ctx.beginPath();
+    ctx.arc(x,y,1.3,0,Math.PI*2);
+    ctx.fill();
+  }
+}
+
+function normalizedShape(points){
+  const nose = points[1];
+  const leftEye = points[33];
+  const rightEye = points[263];
+
+  const dx = rightEye.x-leftEye.x;
+  const dy = rightEye.y-leftEye.y;
+  const scale = Math.hypot(dx,dy) || 1;
+
+  const angle = Math.atan2(dy,dx);
+  const cos = Math.cos(-angle);
+  const sin = Math.sin(-angle);
+
+  return points.map(p=>{
+    const x=(p.x-nose.x)/scale;
+    const y=(p.y-nose.y)/scale;
+    return [
+      x*cos-y*sin,
+      x*sin+y*cos,
+      p.z/scale
+    ];
+  });
+}
+
+function similarity(a,b){
+  if(!a || !b || a.length!==b.length) return 0;
+
+  let sum=0;
+  for(let i=0;i<a.length;i++){
+    const dx=a[i][0]-b[i][0];
+    const dy=a[i][1]-b[i][1];
+    const dz=(a[i][2]-b[i][2])*0.35;
+    sum += Math.sqrt(dx*dx+dy*dy+dz*dz);
+  }
+
+  const mean=sum/a.length;
+  const score = Math.max(0, Math.min(100, 100 * Math.exp(-mean*12)));
+  return score;
+}
+
+function speak(text){
+  if(!("speechSynthesis" in window)) return;
+  speechSynthesis.cancel();
+  const u=new SpeechSynthesisUtterance(text);
+  u.lang="ja-JP";
+  u.rate=1.0;
+  u.pitch=1.0;
+  speechSynthesis.speak(u);
+}
+
+function renderSaved(){
+  const saved=getSaved();
+  savedList.innerHTML="";
+  saved.forEach((item,index)=>{
+    const row=document.createElement("div");
+    row.className="item";
+
+    const text=document.createElement("span");
+    text.textContent=item.name+"（登録済み）";
+
+    const del=document.createElement("button");
+    del.textContent="削除";
+    del.onclick=()=>{
+      const arr=getSaved();
+      arr.splice(index,1);
+      setSaved(arr);
+      renderSaved();
+    };
+
+    row.append(text,del);
+    savedList.appendChild(row);
+  });
+}
+
+saveBtn.addEventListener("click",()=>{
+  if(!currentLandmarks){
+    statusEl.textContent="顔が認識されていません。カメラに顔を映してください。";
+    return;
+  }
+
+  const name=nameInput.value.trim();
+  if(!name){
+    statusEl.textContent="名前を入力してください。";
+    nameInput.focus();
+    return;
+  }
+
+  const shape=normalizedShape(currentLandmarks);
+  const arr=getSaved();
+
+  arr.push({
+    id:Date.now(),
+    name,
+    shape,
+    threshold:90
+  });
+
+  setSaved(arr);
+  armed.set(arr[arr.length-1].id,true);
+  renderSaved();
+
+  statusEl.textContent="「"+name+"」として顔を記憶しました。";
+  nameInput.value="";
+});
+
+clearBtn.addEventListener("click",()=>{
+  if(confirm("保存した顔をすべて削除しますか？")){
+    localStorage.removeItem(STORAGE_KEY);
+    renderSaved();
+    statusEl.textContent="保存した顔を削除しました。";
+  }
+});
+
+// カメラ一覧を取得してドロップダウンを更新
+async function populateCameraList() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const videoDevices = devices.filter(d => d.kind === "videoinput");
+
+  cameraSelect.innerHTML = "";
+  videoDevices.forEach((device, index) => {
+    const option = document.createElement("option");
+    option.value = device.deviceId;
+    option.textContent = device.label || `カメラ ${index + 1}`;
+    cameraSelect.appendChild(option);
+  });
+  return videoDevices;
+}
+
+// カメラを起動・切替する処理
+async function setupCamera(deviceId) {
+  if (currentStream) {
+    currentStream.getTracks().forEach(track => track.stop());
+  }
+
+  const constraints = {
+    video: {
+      width: { ideal: 1280 },
+      height: { ideal: 720 }
+    },
+    audio: false
+  };
+
+  if (deviceId) {
+    constraints.video.deviceId = { exact: deviceId };
+  }
+
+  currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+
+  video.srcObject = currentStream;
+  video2.srcObject = currentStream.clone();
+
+  await Promise.all([video.play(), video2.play()]);
+}
+
+// ドロップダウン変更時にカメラ切り替え
+cameraSelect.addEventListener("change", async () => {
+  const selectedDeviceId = cameraSelect.value;
+  if (!selectedDeviceId) return;
+
+  statusEl.textContent = "カメラを切り替え中…";
+  try {
+    await setupCamera(selectedDeviceId);
+    statusEl.textContent = "カメラを切り替えました。";
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = "カメラ切替エラー: " + err.message;
+  }
+});
+
+async function start(){
+  try {
+    statusEl.textContent = "カメラを起動中…";
+
+    // 1. 最初にデフォルトでカメラを起動（アクセスの許可を取得）
+    await setupCamera();
+
+    // 2. 許可後に検出されたデバイス一覧を取得
+    const videoDevices = await populateCameraList();
+
+    // 外付けカメラ（リストの最後にある端末）があれば自動で優先切替
+    if (videoDevices.length > 1) {
+      const externalCam = videoDevices[videoDevices.length - 1];
+      cameraSelect.value = externalCam.deviceId;
+      await setupCamera(externalCam.deviceId);
+    }
+
+    statusEl.textContent = "カメラ起動完了。認識モデルを読み込み中…";
+
+    // 3. MediaPipeのモデルをロード
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm"
+    );
+
+    faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+      },
+      runningMode: "VIDEO",
+      numFaces: 1,
+      minFaceDetectionConfidence: 0.5,
+      minFacePresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+
+    statusEl.textContent = "準備完了。顔を映してください。";
+    requestAnimationFrame(loop);
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = "エラー: " + err.message + " (http://localhost または https 環境で実行してください)";
+  }
+}
+
+function loop(){
+  if(video.readyState>=2 && faceLandmarker){
+    if(video.currentTime!==lastVideoTime){
+      lastVideoTime=video.currentTime;
+
+      const result=faceLandmarker.detectForVideo(
+        video,
+        performance.now()
+      );
+
+      if(result.faceLandmarks && result.faceLandmarks.length){
+        currentLandmarks=result.faceLandmarks[0];
+
+        canvas.width=video.videoWidth;
+        canvas.height=video.videoHeight;
+        drawLandmarks(currentLandmarks);
+
+        const nowShape=normalizedShape(currentLandmarks);
+        const saved=getSaved();
+
+        let highest=0;
+        let matchedName="";
+
+        for(const item of saved){
+          const score=similarity(nowShape,item.shape);
+          lastSimilarities.set(item.id,score);
+
+          if(score>highest){
+            highest=score;
+            matchedName=item.name;
+          }
+
+          const wasArmed=armed.get(item.id)!==false;
+
+          if(score>=90 && wasArmed){
+            speak(item.name);
+            armed.set(item.id,false);
+          }else if(score<85){
+            armed.set(item.id,true);
+          }
+        }
+
+        if(saved.length){
+          if(highest>=90){
+            statusEl.textContent=
+              "一致 "+highest.toFixed(1)+"%　「"+matchedName+"」";
+          }else{
+            statusEl.textContent=
+              "顔を認識中　最高一致率 "+highest.toFixed(1)+"%";
+          }
+        }else{
+          statusEl.textContent="顔を認識しています。";
+        }
+      }else{
+        currentLandmarks=null;
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        statusEl.textContent="顔をカメラに映してください。";
+      }
+    }
+  }
+
+  requestAnimationFrame(loop);
+}
+
+renderSaved();
+start();
+</script>
+</body>
+</html>
