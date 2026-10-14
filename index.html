@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>手・顔認識</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; width: 100%; min-height: 100%; font-family: system-ui, sans-serif; background: #111; color: #fff; }
+  body { padding: 12px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+  select, button { font: inherit; font-size: 16px; padding: 10px 12px; border-radius: 8px; border: 1px solid #777; }
+  select { background: #222; color: #fff; flex: 1 1 220px; min-width: 160px; }
+  button { background: #f2f2f2; color: #111; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { font-size: 14px; color: #ddd; min-height: 1.5em; margin: 4px 0 10px; }
+  .stage { position: relative; width: 100%; max-width: 1200px; margin: 0 auto; background: #000; overflow: hidden; border-radius: 8px; }
+  canvas { display: block; width: 100%; height: auto; }
+  video { display: none; }
+  .counts { display: flex; gap: 18px; flex-wrap: wrap; font-size: 16px; padding: 10px 2px 0; }
+  .note { color: #bbb; font-size: 12px; line-height: 1.5; margin-top: 10px; }
+  @media (max-width: 600px) { body { padding: 8px; } .counts { font-size: 14px; } }
+</style>
+</head>
+<body>
+  <div class="controls">
+    <select id="cameraSelect" aria-label="カメラ選択">
+      <option value="">カメラを検索しています…</option>
+    </select>
+    <button id="refreshBtn" type="button">カメラ更新</button>
+    <button id="startBtn" type="button">カメラを起動</button>
+    <button id="stopBtn" type="button" disabled>停止</button>
+  </div>
+  <div id="status" role="status">「カメラを起動」を押してください。初回はカメラの使用を許可してください。</div>
+  <div class="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="output" width="1280" height="720"></canvas>
+  </div>
+  <div class="counts">
+    <span id="faceCount">顔：0</span>
+    <span id="handCount">手：0</span>
+    <span id="handSide">左右：—</span>
+  </div>
+  <div class="note">外付けカメラは「カメラ選択」から選んでください。映像の左右反転は表示のみです。認識処理にはインターネット接続が必要です。</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+<script>
+(() => {
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('output');
+  const ctx = canvas.getContext('2d');
+  const cameraSelect = document.getElementById('cameraSelect');
+  const refreshBtn = document.getElementById('refreshBtn');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const statusEl = document.getElementById('status');
+  const faceCountEl = document.getElementById('faceCount');
+  const handCountEl = document.getElementById('handCount');
+  const handSideEl = document.getElementById('handSide');
+
+  let stream = null, running = false, busy = false, rafId = null;
+  let hands = null, faceMesh = null;
+  let latestHands = null, latestFace = null;
+  let lastVideoTime = -1;
+
+  function setStatus(s) { statusEl.textContent = s; }
+  function setButtons(active) {
+    startBtn.disabled = active;
+    stopBtn.disabled = !active;
+  }
+
+  async function refreshCameras() {
+    try {
+      // カメラ一覧取得前に許可がない場合、labelが空のことがあります。
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cams = devices.filter(d => d.kind === 'videoinput');
+      const previous = cameraSelect.value;
+      cameraSelect.innerHTML = '';
+      if (!cams.length) {
+        const opt = document.createElement('option');
+        opt.value = ''; opt.textContent = 'カメラが見つかりません';
+        cameraSelect.appendChild(opt);
+        return;
+      }
+      cams.forEach((cam, i) => {
+        const opt = document.createElement('option');
+        opt.value = cam.deviceId;
+        opt.textContent = cam.label || `カメラ ${i + 1}`;
+        cameraSelect.appendChild(opt);
+      });
+      if (cams.some(c => c.deviceId === previous)) cameraSelect.value = previous;
+      else cameraSelect.selectedIndex = 0;
+    } catch (e) {
+      setStatus('カメラ一覧を取得できません。HTTPSのページで開いてください。');
+    }
+  }
+
+  async function makeModels() {
+    if (hands && faceMesh) return;
+    if (typeof Hands === 'undefined' || typeof FaceMesh === 'undefined') {
+      throw new Error('認識ライブラリを読み込めません。インターネット接続を確認してください。');
+    }
+    hands = new Hands({ locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+    hands.onResults(results => { latestHands = results; });
+
+    faceMesh = new FaceMesh({ locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}` });
+    faceMesh.setOptions({
+      maxNumFaces: 2,
+      refineLandmarks: true,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+    faceMesh.onResults(results => { latestFace = results; });
+  }
+
+  async function startCamera() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus('このページではカメラを利用できません。HTTPSのURLで開いてください。');
+      return;
+    }
+    await stopCamera(false);
+    setStatus('カメラを接続しています…');
+    try {
+      const deviceId = cameraSelect.value;
+      const constraints = {
+        audio: false,
+        video: deviceId
+          ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+          : { width: { ideal: 1280 }, height: { ideal: 720 } }
+      };
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+      await video.play();
+      await refreshCameras();
+      setStatus('認識モデルを読み込んでいます…');
+      await makeModels();
+      running = true;
+      setButtons(true);
+      setStatus('認識中です。手や顔をカメラに映してください。');
+      lastVideoTime = -1;
+      processFrame();
+    } catch (e) {
+      await stopCamera(false);
+      const msg = e && e.name ? `${e.name}: ` : '';
+      let advice = e.message || 'カメラを起動できませんでした。';
+      if (e.name === 'NotAllowedError' || e.name === 'SecurityError') advice = 'カメラが許可されていません。ブラウザのアドレス欄付近のカメラ設定で許可し、ページを再読み込みしてください。';
+      if (e.name === 'NotFoundError') advice = 'カメラが見つかりません。接続と「カメラ更新」を確認してください。';
+      if (e.name === 'NotReadableError') advice = 'カメラを他のアプリが使用中の可能性があります。他のアプリを閉じてください。';
+      setStatus(msg + advice);
+    }
+  }
+
+  async function stopCamera(updateStatus = true) {
+    running = false;
+    busy = false;
+    if (rafId !== null) cancelAnimationFrame(rafId);
+    rafId = null;
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null;
+    video.srcObject = null;
+    latestHands = null;
+    latestFace = null;
+    setButtons(false);
+    drawEmpty();
+    if (updateStatus) setStatus('停止しました。');
+  }
+
+  function drawEmpty() {
+    ctx.save();
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.restore();
+    faceCountEl.textContent = '顔：0';
+    handCountEl.textContent = '手：0';
+    handSideEl.textContent = '左右：—';
+  }
+
+  function drawFrame() {
+    const w = canvas.width, h = canvas.height;
+    ctx.save();
+    ctx.clearRect(0, 0, w, h);
+    // Selfie-style mirror display; the source video remains unchanged for inference.
+    ctx.translate(w, 0);
+    ctx.scale(-1, 1);
+    if (video.readyState >= 2) ctx.drawImage(video, 0, 0, w, h);
+    // Face mesh: draw a light outline and eye/lip contours.
+    const faces = latestFace && latestFace.multiFaceLandmarks ? latestFace.multiFaceLandmarks : [];
+    faces.forEach(landmarks => {
+      if (typeof drawConnectors === 'function' && typeof FACEMESH_TESSELATION !== 'undefined') {
+        drawConnectors(ctx, landmarks, FACEMESH_TESSELATION, { color: 'rgba(80,220,255,0.18)', lineWidth: 1 });
+        drawConnectors(ctx, landmarks, FACEMESH_FACE_OVAL, { color: '#00e5ff', lineWidth: 2 });
+        drawConnectors(ctx, landmarks, FACEMESH_LEFT_EYE, { color: '#ffdf5d', lineWidth: 1.5 });
+        drawConnectors(ctx, landmarks, FACEMESH_RIGHT_EYE, { color: '#ffdf5d', lineWidth: 1.5 });
+        drawConnectors(ctx, landmarks, FACEMESH_LIPS, { color: '#ff6688', lineWidth: 1.5 });
+      }
+    });
+    // Hand skeleton and landmark dots.
+    const handResults = latestHands && latestHands.multiHandLandmarks ? latestHands.multiHandLandmarks : [];
+    handResults.forEach((landmarks, i) => {
+      if (typeof drawConnectors === 'function') {
+        drawConnectors(ctx, landmarks, HAND_CONNECTIONS, { color: i === 0 ? '#45ff8a' : '#ff9d45', lineWidth: 4 });
+        drawLandmarks(ctx, landmarks, { color: '#ffffff', lineWidth: 1, radius: 3 });
+      }
+    });
+    ctx.restore();
+    faceCountEl.textContent = `顔：${faces.length}`;
+    handCountEl.textContent = `手：${handResults.length}`;
+    const sides = latestHands && latestHands.multiHandedness
+      ? latestHands.multiHandedness.map(x => x.label === 'Left' ? '左手' : '右手') : [];
+    handSideEl.textContent = `左右：${sides.length ? sides.join('・') : '—'}`;
+  }
+
+  async function processFrame() {
+    if (!running || busy) return;
+    rafId = requestAnimationFrame(processFrame);
+    if (video.readyState < 2 || video.currentTime === lastVideoTime) return;
+    busy = true;
+    lastVideoTime = video.currentTime;
+    try {
+      await hands.send({ image: video });
+      await faceMesh.send({ image: video });
+      drawFrame();
+    } catch (e) {
+      setStatus('認識処理でエラーが発生しました。ページを再読み込みしてください。');
+      console.error(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  refreshBtn.addEventListener('click', refreshCameras);
+  startBtn.addEventListener('click', startCamera);
+  stopBtn.addEventListener('click', () => stopCamera(true));
+  cameraSelect.addEventListener('change', async () => {
+    if (running) await startCamera();
+  });
+  window.addEventListener('pagehide', () => {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+  });
+
+  drawEmpty();
+  refreshCameras();
+})();
+</script>
+</body>
+</html>
